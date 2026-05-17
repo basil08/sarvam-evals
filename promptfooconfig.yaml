@@ -47,5 +47,4 @@ redteam:
       numTests: 5
   strategies:
     - jailbreak        # baseline iterative refinement
-    - jailbreak:meta   # meta-agent single-turn attacks (best for agentic)
     - crescendo        # gradual multi-turn escalation (targets chatbot use case)
