@@ -1,0 +1,5 @@
+.env
+output/
+.promptfoo/
+sarvam*/
+llama.cpp/
