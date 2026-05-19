@@ -428,6 +428,130 @@ promptfoo redteam run --config promptfooconfig.hindi.yaml --output output/hindi_
 
 ---
 
+## 2026-05-19 — Cloud Migration to Modal (GPU)
+
+### Why Modal
+
+Mac Metal inference is too slow for Phase 2 scale (jailbreak:tree, full OWASP, Tamil/Telugu/Bengali). Modal lets us run the patched llama-server on a cloud GPU, pay per second, and keep the same OpenAI-compatible API that promptfoo already targets.
+
+### Infrastructure Design
+
+| Component | Decision |
+|-----------|----------|
+| GPU | A100-40GB (40GB VRAM, 1555 GB/s) — ~1.8x faster than L40S at same price ($2.10/hr). Model ~17GB + KV cache ~8GB ≈ 25GB fits. |
+| Image base | `nvidia/cuda:12.4.1-devel-ubuntu22.04` — need to compile patched source |
+| llama.cpp | Compiled from `./llama.cpp/` in Modal image build (patched build, NOT official image) |
+| Model storage | Modal Volume `sarvam-model-weights` — upload once (~18.8GB), reuse every run |
+| Endpoint | `@modal.web_server(port=8080)` — same OpenAI-compat API, Modal proxies to HTTPS URL |
+
+**Why NOT the official llama.cpp Docker image:**  
+`ghcr.io/ggerganov/llama.cpp:server-cuda` doesn't have the Sarvam patches. The `--reasoning-budget` and `--reasoning-format deepseek` flags only exist in the local patched build. The Modal image snapshots `./llama.cpp/` source (minus `.git` and `build/`) and compiles it with `-DGGML_CUDA=ON`.
+
+**`--mlock` removed for cloud:** All layers offload to GPU (`--n-gpu-layers 999`), so there's nothing to lock in CPU RAM. Also container syscall constraints make it unreliable.
+
+**`--host` changed:** `127.0.0.1` → `0.0.0.0`. Modal proxies external HTTPS traffic to the container port; `127.0.0.1` would silently block all requests.
+
+### Files Created
+
+```
+sarvam-evals/
+├── modal_serve.py          # Modal app — image build + web_server deployment
+└── modal_upload_model.py   # One-time model shard upload to Modal Volume
+```
+
+### Step-by-Step Deployment
+
+**Prerequisites (once):**
+```bash
+pip install modal
+modal setup       # browser OAuth to your Modal account
+```
+
+**Step 1 — Upload model shards to Modal Volume (~18.8GB, do once):**
+```bash
+python modal_upload_model.py
+```
+Takes 10–20 min. Uploads all 6 GGUF shards to a persistent `sarvam-model-weights` volume.
+Verify with: `modal volume ls sarvam-model-weights`
+
+**Step 2 — Test the image build (ephemeral, no persistent URL):**
+```bash
+modal serve modal_serve.py
+```
+This builds the image (15–25 min first time — cmake compiles llama.cpp), starts the server, and prints a temporary HTTPS URL. Use this to smoke-test before deploying.
+
+Smoke test while it's running:
+```bash
+curl https://<your-modal-url>/v1/models
+curl -X POST https://<your-modal-url>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sarvam-30b","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":512}'
+```
+
+**Step 3 — Deploy persistently:**
+```bash
+modal deploy modal_serve.py
+```
+Prints a stable URL like `https://basil--sarvam-llama-server-serve.modal.run`.
+Image is cached after first build — subsequent deploys are fast (~60s).
+
+**Step 4 — Update promptfooconfig to point at Modal:**
+```yaml
+# promptfooconfig.yaml and promptfooconfig.hindi.yaml
+targets:
+  - id: openai:chat:sarvam-30b
+    config:
+      apiBaseUrl: https://basil--sarvam-llama-server-serve.modal.run/v1
+      apiKey: dummy
+      max_tokens: 2048
+```
+
+**Step 5 — Run evals (server starts on first request, cold start ~60s):**
+```bash
+export ANTHROPIC_API_KEY=$(grep ANTHROPIC_API_KEY .env | cut -d= -f2)
+promptfoo redteam run --config promptfooconfig.yaml --output output/english_results.json
+```
+
+**Step 6 — Stop billing when done (Modal charges per second of GPU time):**
+```bash
+modal app stop sarvam-llama-server
+```
+The Volume persists (free), the container spins down. Re-deploy anytime with `modal deploy`.
+
+### Cost Estimate
+
+| Item | Rate | Estimate |
+|------|------|----------|
+| A100-40GB GPU | ~$2.10/hr | Phase 1 full run (~2hr) ≈ $4; Phase 2 (~6hr) ≈ $13 |
+| Volume storage | ~$0.05/GB/month | 19GB ≈ $1/month |
+| Image build (one-time) | ~$0.20 | - |
+
+### Fixes Applied During Initial Deploy
+
+**Fix 1: `container_idle_timeout` → `scaledown_window`**
+
+Modal renamed this parameter on 2025-02-24. Updated in `modal_serve.py`.
+
+**Fix 2: `add_local_dir` requires `copy=True` when followed by `run_commands`**
+
+Modal defers `add_local_*` file injection to container startup by default, which blocks subsequent build steps (cmake). Setting `copy=True` bakes the source into the image layer so `run_commands` can compile against it. Tradeoff: any llama.cpp source change invalidates the cmake cache layer, but since the patched source is stable between eval runs this is acceptable.
+
+```python
+.add_local_dir("llama.cpp", remote_path="/build/llama.cpp", copy=True, ignore=[...])
+```
+
+### Troubleshooting
+
+**Build fails: `nvcc not found`** — wrong CUDA base image tag; `12.4.1-devel` includes nvcc, `runtime` does not.
+
+**`--reasoning-budget` flag not recognized** — the image accidentally used official llama.cpp. Check that `modal_serve.py` is snapshotting `./llama.cpp/` not pulling from a registry.
+
+**Container exits immediately** — model path wrong in volume. Run `modal volume ls sarvam-model-weights` to verify shard filenames match what's in `modal_serve.py`.
+
+**Cold start timeout in promptfoo** — first request after container idle spins up a new container (~60s load time for 30B). If promptfoo times out, increase its timeout or hit the endpoint manually first to warm it.
+
+---
+
 ## Phase 2 Roadmap
 
 | Target | Description |
