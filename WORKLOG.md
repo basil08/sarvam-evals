@@ -552,6 +552,187 @@ Modal defers `add_local_*` file injection to container startup by default, which
 
 ---
 
+## 2026-05-22 — Runpod Migration (Modal abandoned)
+
+### Why Runpod
+
+Modal deployment failed (unresolved issues). Switched to Runpod: same GPU tier (A100-40GB), direct SSH access, simpler networking model.
+
+---
+
+### Infrastructure
+
+| Component | Decision |
+|-----------|----------|
+| Pod | Runpod `growing_aquamarine_starfish`, ID `819b6t3nlbvg40` |
+| GPU | A100-40GB |
+| OS | Ubuntu (PyTorch template) |
+| llama.cpp | Compiled from `./llama.cpp/` source on pod (same patched build — `--reasoning-budget`, `--reasoning-format deepseek` required) |
+| Model | Rsync'd 6 GGUF shards from Mac → `/workspace/models/` on pod |
+
+---
+
+### Step-by-Step: First-Time Pod Setup
+
+**1. Launch pod on runpod.io**
+- Template: RunPod PyTorch (includes CUDA devel tools)
+- GPU: A100-40GB (≥24GB VRAM needed; model loads ~17GB)
+- Container disk: 50GB (18.8GB model + build artifacts)
+
+**2. SSH into pod**
+```bash
+ssh root@157.157.221.29 -p 17273 -i ~/.ssh/id_ed25519
+```
+
+**3. Install build deps and compile patched llama.cpp**
+```bash
+apt-get update && apt-get install -y cmake build-essential libcurl4-openssl-dev ccache
+
+# Fix: libcuda.so.1 stub needed for link-time CUDA symbol resolution
+ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+echo '/usr/local/cuda/lib64/stubs' > /etc/ld.so.conf.d/cuda-stubs.conf
+ldconfig
+```
+
+Upload patched source from Mac (run on Mac, not pod):
+```bash
+rsync -avz --exclude='.git' --exclude='build' \
+  /Users/Basil/dev/sarvam-evals/llama.cpp/ \
+  root@157.157.221.29 -p 17273:/workspace/llama.cpp/
+```
+
+Then compile on pod:
+```bash
+mkdir -p /workspace/llama-build
+cmake -B /workspace/llama-build -S /workspace/llama.cpp \
+  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build /workspace/llama-build -j$(nproc) --target llama-server
+# Build takes ~10-15 min
+```
+
+**4. Upload model shards from Mac (~18.8GB, run on Mac)**
+```bash
+rsync -avz --progress \
+  /Users/Basil/dev/sarvam-evals/sarvam-30b-gguf/ \
+  root@157.157.221.29 -p 17273:/workspace/models/
+# Takes 20-40 min depending on upload speed
+```
+
+**5. Start llama-server on pod**
+```bash
+/workspace/llama-build/bin/llama-server \
+  -m /workspace/models/sarvam-30b-Q4_K_M.gguf-00001-of-00006.gguf \
+  --n-gpu-layers 999 \
+  --ctx-size 32768 \
+  --flash-attn on \
+  --batch-size 512 \
+  -t 8 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --reasoning-budget 1024 \
+  --reasoning-format deepseek
+```
+
+Key diffs vs `start_server.sh`: `--host 0.0.0.0` (not `127.0.0.1`), no `--mlock` (all layers on GPU).
+
+Model loads in ~60s. Verify from pod:
+```bash
+curl http://localhost:8080/v1/models
+```
+
+---
+
+### Problem: Port 8080 Not Exposed — Can't Hit Server from Mac
+
+**Symptom:** `curl http://157.157.221.29:<port>/v1/models` fails. The Runpod Connect UI only showed:
+- HTTP proxy: port 8888 (Jupyter)
+- Direct TCP: `157.157.221.29:17273 → :22` (SSH only)
+
+Port 8080 had no external mapping.
+
+**Root cause:** Runpod only exposes ports that are explicitly configured at pod creation time. Port 8080 was never added, so there's no TCP proxy for it.
+
+**Fix A — SSH tunnel (no pod restart, use when model is already running):**
+```bash
+# Run on Mac, keep terminal open
+ssh -L 8080:localhost:8080 root@157.157.221.29 -p 17273 -i ~/.ssh/id_ed25519 -N
+```
+With the tunnel active, `http://localhost:8080/v1` on Mac routes to the pod's port 8080.
+
+promptfooconfig stays as-is:
+```yaml
+config:
+  apiBaseUrl: http://localhost:8080/v1
+  apiKey: dummy
+```
+
+**Fix B — Expose port at pod creation (permanent, no tunnel needed):**
+Stop pod → Edit → Customize Deployment → add TCP port `8080` → redeploy.
+Runpod will assign an external port, shown as `157.157.221.29:<extport> → :8080`.
+Use `http://157.157.221.29:<extport>/v1` as `apiBaseUrl`.
+
+Fix A is faster when the model is already loaded. Fix B is cleaner for repeated use.
+
+---
+
+### Problem: `cmake --build` — "could not load cache"
+
+**Symptom:** `cmake --build /workspace/llama-build` exits immediately with `could not load cache`.
+
+**Root cause:** cmake's configure step (`cmake -B`) didn't complete — `CMakeCache.txt` was never written. Most common causes:
+1. `nvcc` not found (pod template uses CUDA runtime image, not devel)
+2. `libcuda.so.1` stub missing (linker can't resolve CUDA symbols)
+3. Build dir missing or wrong path
+
+**Diagnosis:**
+```bash
+# Check configure output directly
+cmake -B /workspace/llama-build -S /workspace/llama.cpp \
+  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -50
+
+which nvcc && nvcc --version
+ls /workspace/llama-build/CMakeCache.txt
+```
+
+**Fix:** Apply the libcuda stub step (step 3 above) before running cmake, then wipe and re-run configure from a clean dir:
+```bash
+rm -rf /workspace/llama-build && mkdir /workspace/llama-build
+cmake -B /workspace/llama-build -S /workspace/llama.cpp \
+  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+```
+
+---
+
+### Running Evals Against Runpod (SSH tunnel active)
+
+```bash
+# On Mac — open tunnel in background tab first:
+ssh -L 8080:localhost:8080 root@157.157.221.29 -p 17273 -i ~/.ssh/id_ed25519 -N &
+
+# Verify tunnel works
+curl http://localhost:8080/v1/models
+
+# Run Phase 1 English
+export ANTHROPIC_API_KEY=$(grep ANTHROPIC_API_KEY .env | cut -d= -f2)
+promptfoo redteam run --config promptfooconfig.yaml --output output/english_results.json
+
+# Run Phase 1 Hindi
+promptfoo redteam run --config promptfooconfig.hindi.yaml --output output/hindi_results.json
+
+# View report
+promptfoo redteam report
+
+# Dual-judge analysis
+/Users/Basil/miniconda3/envs/sarvam-evals/bin/python3 scripts/compare_judges.py \
+  --input output/english_results.json
+/Users/Basil/miniconda3/envs/sarvam-evals/bin/python3 scripts/compare_judges.py \
+  --input output/hindi_results.json
+```
+
+Stop the pod from Runpod UI when done to stop billing.
+
+---
+
 ## Phase 2 Roadmap
 
 | Target | Description |

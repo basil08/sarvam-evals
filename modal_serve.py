@@ -43,8 +43,14 @@ image = (
         ],
     )
     .run_commands(
+        # libcuda.so.1 is the NVIDIA driver library — it lives on the host, not in
+        # build containers. The CUDA devel image ships a stub at stubs/libcuda.so
+        # for exactly this case. Expose it as libcuda.so.1 so the linker can resolve
+        # the cuMem* symbols in libggml-cuda.so at build time.
+        "ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1"
+        " && echo '/usr/local/cuda/lib64/stubs' > /etc/ld.so.conf.d/cuda-stubs.conf"
+        " && ldconfig",
         # -DGGML_CUDA=ON: enable CUDA backend
-        # separate build dir keeps source tree clean
         "cmake -B /opt/llama-build -S /build/llama.cpp"
         " -DGGML_CUDA=ON"
         " -DCMAKE_BUILD_TYPE=Release",
