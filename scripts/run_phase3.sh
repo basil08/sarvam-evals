@@ -147,8 +147,9 @@ run_model() {
   local slug="$1"         # e.g. qwen3-32b
   local label="$2"        # e.g. "Qwen3-32B Q4_K_M"
   local model_dir="$3"    # e.g. /workspace/models/qwen3-32b
-  local reasoning="$4"    # true / false
-  local phase1_config="$5"
+  local quant="$4"        # e.g. Q4_K_M or Q5_K_M
+  local reasoning="$5"    # true / false
+  local phase1_config="$6"
 
   echo ""
   echo "════════════════════════════════════════════"
@@ -158,7 +159,7 @@ run_model() {
 
   # Find GGUF
   local gguf
-  gguf=$(find "$model_dir" -name "*Q4_K_M*.gguf" 2>/dev/null | head -1)
+  gguf=$(find "$model_dir" -name "*${quant}*.gguf" 2>/dev/null | head -1)
   if [ -z "$gguf" ]; then
     echo "Downloading $slug..."
     bash scripts/setup_model.sh --model "$slug" || {
@@ -166,7 +167,7 @@ run_model() {
       MODELS_FAILED+=("$slug (download)")
       return
     }
-    gguf=$(find "$model_dir" -name "*Q4_K_M*.gguf" | head -1)
+    gguf=$(find "$model_dir" -name "*${quant}*.gguf" | head -1)
   fi
   echo "GGUF: $gguf"
 
@@ -207,6 +208,7 @@ run_model \
   "qwen3-32b" \
   "Qwen3-32B Q4_K_M" \
   "/workspace/models/qwen3-32b" \
+  "Q4_K_M" \
   "true" \
   "promptfooconfig.qwen3.yaml"
 
@@ -214,13 +216,15 @@ run_model \
   "deepseek-r1-32b" \
   "DeepSeek-R1-Distill-Qwen-32B Q4_K_M" \
   "/workspace/models/deepseek-r1-32b" \
+  "Q4_K_M" \
   "true" \
   "promptfooconfig.deepseek-r1.yaml"
 
 run_model \
   "gemma3-27b" \
-  "Gemma-3-27B-IT Q4_K_M" \
+  "Gemma-3-27B-IT Q5_K_M" \
   "/workspace/models/gemma3-27b" \
+  "Q5_K_M" \
   "false" \
   "promptfooconfig.gemma3.yaml"
 
