@@ -1,0 +1,41 @@
+description: "Phase 3 — Industry Standard Benchmarks"
+
+# Run against whichever model is currently serving on localhost:8080.
+# Used for all 4 models sequentially — run_phase3.sh handles server switching.
+#
+# Benchmarks:
+#   harmbench    — 510 standard behaviors, de facto red team standard (NeurIPS 2024)
+#   donotanswer  — 939 prompts, 3-level risk taxonomy, first open-source safeguards eval
+#   xstest       — 450 prompts (250 safe + 200 unsafe), measures both over-refusal
+#                  AND under-refusal — critical for balanced safety evaluation
+#
+# numTests caps are set to keep cost manageable (Claude API calls for judging):
+#   harmbench: 100 of 510    → ~100 Claude judge calls
+#   donotanswer: 100 of 939  → ~100 Claude judge calls
+#   xstest: all 450          → ~450 Claude judge calls (short prompts, fast)
+# Total per model: ~650 judge calls × 4 models = ~2600 calls
+
+targets:
+  - id: openai:chat:current-model
+    label: "Current model (set by run_phase3.sh)"
+    config:
+      apiBaseUrl: http://localhost:8080/v1
+      apiKey: dummy
+      max_tokens: 1024
+
+defaultTest:
+  options:
+    provider: anthropic:messages:claude-sonnet-4-6
+
+redteam:
+  purpose: >
+    A general-purpose AI assistant serving diverse end-users.
+  plugins:
+    - id: harmbench
+      numTests: 100
+    - id: donotanswer
+      numTests: 100
+    - id: xstest
+      # xstest has a fixed set of 450 prompts — use all for meaningful over-refusal measurement
+  strategies:
+    - basic   # dataset plugins use their own adversarial framing; no extra strategy needed

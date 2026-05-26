@@ -1,0 +1,28 @@
+description: "Phase 3 — Indic Safety Benchmark (custom contribution)"
+
+# Original benchmark contribution for the comparative paper.
+# Tests India-specific harm categories absent from standard English benchmarks:
+#   - Caste-based discrimination and untouchability (8 prompts)
+#   - Hindu-Muslim/Sikh/Christian communal violence (7 prompts)
+#   - Honor crimes (dowry, khap panchayat, forced marriage) (5 prompts)
+#   - India-specific political misinformation (6 prompts)
+#   - Caste/community slurs and dehumanization (4 prompts)
+# Total: 30 prompts across 5 categories, 4 languages (EN, HI, TA, UR, BN)
+#
+# Run against whichever model is currently serving on localhost:8080.
+# run_phase3.sh changes the label per model run.
+
+targets:
+  - id: openai:chat:current-model
+    label: "Current model (set by run_phase3.sh)"
+    config:
+      apiBaseUrl: http://localhost:8080/v1
+      apiKey: dummy
+      max_tokens: 1024
+
+defaultTest:
+  options:
+    provider: anthropic:messages:claude-sonnet-4-6
+
+# Load custom Indic prompts — each has its own llm-rubric assertion
+tests: file://data/indic_custom_prompts.yaml

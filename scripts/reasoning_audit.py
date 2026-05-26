@@ -148,7 +148,7 @@ def audit(results: list, source_label: str) -> list:
     return cases
 
 
-def write_report(cases: list, output_path: str, sources: list):
+def write_report(cases: list, output_path: str, sources: list, compare_models: bool = False):
     counts = Counter(c["category"] for c in cases)
     by_plugin = defaultdict(lambda: Counter())
     by_source = defaultdict(lambda: Counter())
@@ -174,6 +174,40 @@ def write_report(cases: list, output_path: str, sources: list):
     for cat, n in counts.most_common():
         lines.append(f"| `{cat}` | {n} |")
     lines.append("")
+
+    # Cross-model comparison table (Phase 3 mode)
+    if compare_models:
+        lines.append("## Cross-Model CoT Leakage Comparison\n")
+        lines.append("Key metric for the paper: `cot_only_leak` rate = harmful plans in CoT even when content refuses.\n")
+
+        # Infer model name from source filename stem
+        MODEL_ALIASES = {
+            "hindi_results":           "Sarvam 30B (Hindi)",
+            "english_results_v2":      "Sarvam 30B (English)",
+            "qwen3-32b_results":       "Qwen3-32B",
+            "deepseek-r1-32b_results": "DeepSeek-R1-Distill-32B",
+            "gemma3-27b_results":      "Gemma-3-27B-IT",
+        }
+
+        # Count total FAIL cases per source to compute rates
+        total_fails: dict = defaultdict(int)
+        for c in cases:
+            total_fails[c["source"]] += 1  # cases already filtered to FAIL
+
+        lines.append("| Model | cot_only_leak | full_leak | content_only | cot_leak_rate |")
+        lines.append("|-------|---------------|-----------|--------------|---------------|")
+        for src, cats in sorted(by_source.items()):
+            model_name = MODEL_ALIASES.get(src, src)
+            total = sum(cats.values())
+            cot_rate = f"{cats['cot_only_leak']/total*100:.1f}%" if total > 0 else "—"
+            lines.append(
+                f"| {model_name} | {cats['cot_only_leak']} | {cats['full_leak']} "
+                f"| {cats['content_only']} | {cot_rate} |"
+            )
+        lines.append("")
+        lines.append("> **Interpretation:** High `cot_only_leak` rate in a reasoning model means the model")
+        lines.append("> generates harmful content in its thinking chain but suppresses it in the final response.")
+        lines.append("> Gemma-3 (non-reasoning) is the control — expected near-zero rate.\n")
 
     lines.append("## By Plugin\n")
     lines.append("| Plugin | cot_only_leak | full_leak | content_only |")
@@ -217,6 +251,8 @@ def main():
                         help="Path to Promptfoo results JSON (can specify multiple)")
     parser.add_argument("--output", default="output/reasoning_audit.md",
                         help="Output markdown report path")
+    parser.add_argument("--compare-models", action="store_true",
+                        help="Add cross-model CoT leakage comparison table (Phase 3 mode)")
     args = parser.parse_args()
 
     all_cases = []
@@ -232,7 +268,7 @@ def main():
         print("No flagged cases found.")
         sys.exit(0)
 
-    write_report(all_cases, args.output, args.input)
+    write_report(all_cases, args.output, args.input, compare_models=args.compare_models)
 
 
 if __name__ == "__main__":

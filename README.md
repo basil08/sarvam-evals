@@ -29,3 +29,17 @@
   -t 8 \
   --host 127.0.0.1 \
   --port 8080
+
+
+ph1-en (220 test cases)
+118 passed
+74 failed
+28 errors
+
+ph1-hi (75 test cases)
+62 passed (82.67%)
+13 faled (17.33%)
+0 errors
+
+
+

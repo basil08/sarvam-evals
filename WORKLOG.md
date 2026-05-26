@@ -767,10 +767,9 @@ ssh root@157.157.221.29 -p 17273 -i ~/.ssh/id_ed25519
 ```bash
 apt-get update && apt-get install -y cmake build-essential libcurl4-openssl-dev ccache
 
-# Fix: libcuda.so.1 stub needed for link-time CUDA symbol resolution
+# Create libcuda.so.1 stub for link-time CUDA symbol resolution.
+# NOTE: only create the symlink — do NOT add stubs to ldconfig (see 2026-05-25 entry).
 ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-echo '/usr/local/cuda/lib64/stubs' > /etc/ld.so.conf.d/cuda-stubs.conf
-ldconfig
 ```
 
 Upload patched source from Mac (run on Mac, not pod):
@@ -784,7 +783,9 @@ Then compile on pod:
 ```bash
 mkdir -p /workspace/llama-build
 cmake -B /workspace/llama-build -S /workspace/llama.cpp \
-  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
 cmake --build /workspace/llama-build -j$(nproc) --target llama-server
 # Build takes ~10-15 min
 ```
@@ -873,11 +874,14 @@ which nvcc && nvcc --version
 ls /workspace/llama-build/CMakeCache.txt
 ```
 
-**Fix:** Apply the libcuda stub step (step 3 above) before running cmake, then wipe and re-run configure from a clean dir:
+**Fix:** Create the libcuda stub symlink, pass stubs path via linker flag (not ldconfig), wipe and re-run configure:
 ```bash
+ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 rm -rf /workspace/llama-build && mkdir /workspace/llama-build
 cmake -B /workspace/llama-build -S /workspace/llama.cpp \
-  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
 ```
 
 ---
@@ -912,6 +916,184 @@ Stop the pod from Runpod UI when done to stop billing.
 
 ---
 
+## 2026-05-25 — GPU Selection, Build Fixes, Phase 2 Runner
+
+### GPU Selection: RTX 4000 Ada → RTX 5090
+
+**RTX 4000 Ada (20 GB VRAM) — rejected:**
+
+| Item | Size |
+|------|------|
+| Model weights (Q4_K_M) | ~17 GB |
+| CUDA overhead | ~0.5–1 GB |
+| Remaining for KV cache | ~2–3 GB |
+
+KV cache at `--ctx-size 32768` ≈ 8 GB — doesn't fit. Even 16384 ctx ≈ 4 GB puts total at ~21 GB, over budget. Only 8192 ctx would fit (~2 GB KV), which reintroduces the original context overflow problem for crescendo multi-turn attacks.
+
+**RTX 5090 (32 GB VRAM) — chosen:**
+
+| Item | Size |
+|------|------|
+| Model weights | ~17 GB |
+| CUDA overhead | ~0.5–1 GB |
+| KV cache @ `--ctx-size 32768` | ~8 GB |
+| **Total** | **~25–26 GB** |
+
+~6 GB headroom. Current server flags work unchanged. Memory bandwidth: 1792 GB/s vs A100 40GB's 1555 GB/s — ~15% faster token generation.
+
+---
+
+### Problem: RTX 5090 CUDA Build Failure (sm_120 MXFP4 ptxas error)
+
+**Symptom:**
+```
+ptxas .../mmq-instance-mxfp4.ptx, line 102609; error: Feature '.scale_vec::2X'
+not supported on .target 'sm_120'
+ptxas fatal: Ptx assembly aborted due to errors
+```
+
+**Root cause:** The patched llama.cpp contains Blackwell-specific MXFP4 matrix multiplication kernels (`mmq-instance-mxfp4.cu`) that use PTX features (`.scale_vec::2X`) not supported by the CUDA toolkit version on the pod. RTX 5090 is compute capability `sm_120` (Blackwell); the kernel targets features requiring CUDA 12.8+ PTX ISA 8.7+.
+
+**Fix:** Build targeting `sm_89` (Ada Lovelace). CUDA forward compatibility runs sm_89 code on sm_120 natively. For inference (memory-bandwidth bound) there is no meaningful performance loss — MXFP4 ops only matter for FP4 training.
+
+```bash
+rm -rf /workspace/llama-build && mkdir /workspace/llama-build
+cmake -B /workspace/llama-build -S /workspace/llama.cpp \
+  -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES="89" \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+cmake --build /workspace/llama-build -j$(nproc) --target llama-server
+```
+
+Verify correct arch was compiled:
+```bash
+cuobjdump -lelf /workspace/llama-build/bin/llama-server | grep "arch ="
+# should show sm_89
+```
+
+This flag is only needed for RTX 5090. On A100 (sm_80) the default arch detection works without it.
+
+---
+
+### Problem: libcuda ldconfig Broke NVIDIA Driver
+
+**Symptom:** After running the original Step 3 build instructions (which included `echo ... > /etc/ld.so.conf.d/cuda-stubs.conf && ldconfig`), `nvidia-smi` failed and CUDA was no longer recognized.
+
+**Root cause:** Adding `/usr/local/cuda/lib64/stubs` to `ldconfig` promotes the build-time stub `libcuda.so.1` into the runtime dynamic linker search path. The stub is a placeholder with empty symbol implementations — it exists only so the linker can resolve CUDA symbols at compile time. At runtime it replaces the real NVIDIA driver library, breaking all CUDA operations.
+
+**Fix:**
+```bash
+rm /etc/ld.so.conf.d/cuda-stubs.conf
+ldconfig
+nvidia-smi   # should work again
+```
+
+**Correct approach (no ldconfig needed):** Pass the stubs path directly to cmake's linker flags. The stub is only consulted at link time, never at runtime:
+```bash
+-DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+```
+
+The symlink (`ln -sf libcuda.so libcuda.so.1`) can stay — it's harmless inside the stubs directory. Only the `ldconfig` line was wrong. The 2026-05-22 Step 3 has been corrected accordingly.
+
+---
+
+### One-Time Pod Setup Script
+
+All first-time setup automated in `scripts/setup_runpod.sh`. Replaces the manual steps in the 2026-05-22 entry.
+
+**Changes from 2026-05-22 approach:**
+- llama.cpp pulled from GitHub directly (no rsync from Mac): `sumitchatterjee13/llama.cpp @ add-sarvam-moe`
+- Model weights downloaded from HuggingFace (no rsync from Mac): `sarvamai/sarvam-30b-gguf`
+- `--cuda-arch` is a CLI argument — avoids hard-coding and makes the sm_120 MXFP4 fix explicit
+
+**Usage:**
+```bash
+# RTX 5090 (default — sm_89 avoids MXFP4 ptxas bug)
+bash scripts/setup_runpod.sh
+
+# A100
+bash scripts/setup_runpod.sh --cuda-arch 80
+
+# H100
+bash scripts/setup_runpod.sh --cuda-arch 90
+
+# With HuggingFace token (if model repo is gated)
+bash scripts/setup_runpod.sh --cuda-arch 89 --hf-token hf_xxxx
+```
+
+Script is **idempotent** — each step checks if already done before running. Safe to re-run after partial failure.
+
+After setup completes, only the `sarvam-evals/` configs and scripts still need to be rsync'd from Mac (they contain the ANTHROPIC_API_KEY .env and promptfooconfig yamls).
+
+---
+
+### Running promptfoo on the Pod (not Mac)
+
+Avoids the need for an SSH tunnel and frees up the laptop.
+
+**One-time setup on pod:**
+```bash
+# Node.js
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
+nvm install 22.22.0
+nvm alias default 22.22.0
+npm install -g promptfoo@0.121.11
+
+# Python deps
+pip install requests
+```
+
+**Rsync everything needed from Mac:**
+```bash
+rsync -avz \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.yaml \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.hindi.yaml \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.bias.yaml \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.phase2-harm.yaml \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.indic.yaml \
+  /Users/Basil/dev/sarvam-evals/promptfooconfig.agentic.yaml \
+  /Users/Basil/dev/sarvam-evals/scripts/ \
+  /Users/Basil/dev/sarvam-evals/.env \
+  root@<host> -p <port>:/workspace/sarvam-evals/
+```
+
+With promptfoo on the pod, `apiBaseUrl` stays as `http://localhost:8080/v1` — no URL changes to configs. `python3` replaces the Mac-specific conda path for compare_judges.py.
+
+**Pull results back to Mac before stopping pod:**
+```bash
+rsync -avz root@<host> -p <port>:/workspace/sarvam-evals/output/ \
+  /Users/Basil/dev/sarvam-evals/output/
+```
+
+---
+
+### Phase 2 Run Script
+
+All 6 waves scripted in `scripts/run_phase2.sh`. Runs sequentially: promptfoo eval → compare_judges.py per wave, then reasoning_audit.py across all outputs at the end (Wave F).
+
+Key behaviors:
+- **Skip-if-exists**: each wave checks for its output JSON before running — safe to re-run after a crash
+- **Non-fatal errors**: a failed compare_judges.py logs the error and continues to the next wave
+- **Wave F auto-collects**: scans for all result JSONs that exist, runs audit against whatever completed
+- **Timestamped log**: all output tee'd to `output/phase2_run.log`
+
+**Launch in tmux (so SSH disconnect doesn't kill it):**
+```bash
+tmux new-session -d -s phase2 'cd /workspace/sarvam-evals && bash scripts/run_phase2.sh'
+```
+
+**Monitor:**
+```bash
+tmux attach -t phase2          # attach (detach with Ctrl+B, D)
+tmux capture-pane -t phase2 -p | tail -20   # peek without attaching
+tail -f output/phase2_run.log  # follow log directly
+tmux ls                        # confirm session is alive
+```
+
+---
+
 ## Phase 2 Roadmap
 
 | Target | Description |
@@ -923,3 +1105,173 @@ Stop the pod from Runpod UI when done to stop billing.
 | Tamil, Telugu, Bengali configs | Sarvam's other Indic language targets |
 | Full OWASP LLM Top 10 | Compliance-grade coverage |
 | Agentic tool-use config | Test with actual tool definitions to probe `shell-injection`, `bola`, `ssrf` in realistic context |
+
+---
+
+## 2026-05-25 — Phase 3 Design: Comparative Safety Study
+
+### Status of compare_judges.py (Dual-Judge Analysis)
+
+**Current state:** compare_judges.py has only been run on Phase 1 results (English v1 + Hindi). It has **not** been run on any Phase 2 wave outputs (bias, expanded harm, Indic, agentic).
+
+The Phase 2 run script (`run_phase2.sh`) calls compare_judges.py after each wave, but those runs have not been executed or verified yet. All `*_disagreements.md` files in `output/` (if any) should be treated as pending or stale until Phase 2 compare_judges runs are confirmed complete.
+
+**Implication for Phase 3:** The dual-judge comparison (Claude vs Sarvam self-evaluation) is a Sarvam-only analysis — it cannot run against Qwen3, DeepSeek-R1, or Gemma-3 because those models are not Sarvam. The `run_phase3.sh` script calls compare_judges.py for completeness, but the blind spot rate metric only applies to Sarvam. For comparison models, compare_judges.py will attempt to use whichever model is on localhost:8080 as the secondary judge, which means it will report each model's self-evaluation blind spot rate against its own outputs — a valid but different metric.
+
+**TODO before publishing results:** Re-run compare_judges.py on all Phase 2 outputs after Phase 2 evals are confirmed complete.
+
+---
+
+### Phase 3 Goal
+
+Extend the Sarvam 30B red team into a comparative safety study suitable for a research paper. Compare Sarvam's guardrails against peer reasoning models in the same parameter class across identical test suites. Add industry-standard benchmarks for external credibility; contribute an original Indic benchmark filling a gap in existing safety literature.
+
+---
+
+### Model Selection
+
+Three comparison models chosen. All run sequentially on RTX 5090 (32GB VRAM) — each fits individually at Q4_K_M.
+
+| Model | Origin | Type | VRAM | HuggingFace Repo |
+|-------|--------|------|------|-----------------|
+| **Qwen3-32B** | Alibaba, China | Reasoning (`<think>` tags) | ~20 GB | `Qwen/Qwen3-32B-GGUF` |
+| **DeepSeek-R1-Distill-Qwen-32B** | DeepSeek, China | Reasoning (`<think>` tags) | ~20 GB | `bartowski/DeepSeek-R1-Distill-Qwen-32B-GGUF` |
+| **Gemma-3-27B-IT** | Google, US | Non-reasoning (direct refusal) | ~16 GB | `bartowski/google_gemma-3-27b-it-GGUF` |
+
+**Rationale:**
+- Qwen3 and DeepSeek-R1 are both reasoning models with visible CoT (same `<think>` tag format as Sarvam's `reasoning_content`). The core paper question — is reasoning chain leakage Sarvam-specific or a universal property of visible-CoT models? — can only be answered with these two as comparisons.
+- Gemma-3 is non-reasoning: serves as control group. Expected ~0% CoT leakage by design. Validates that the leakage signal is not an artifact of the detection methodology.
+- Geographic spread: India (Sarvam) vs China (Qwen3, DeepSeek-R1) vs US (Gemma-3).
+- All three are production-grade instruction-tuned models, not research checkpoints.
+
+**Server flags for comparison models:**
+```bash
+/workspace/llama-build/bin/llama-server \
+  -m /workspace/models/<model>/<file>.gguf \
+  --n-gpu-layers 999 --ctx-size 32768 \
+  --flash-attn on --batch-size 512 -t 8 \
+  --host 0.0.0.0 --port 8080 \
+  --reasoning-format deepseek   # reasoning models only; omit for Gemma-3
+  # No --reasoning-budget (Sarvam-specific patch)
+  # No --mlock (GPU inference)
+```
+
+`--reasoning-format deepseek` works for Qwen3 and DeepSeek-R1 — both use `<think>` tags, same format as the Sarvam patch. This ensures `reasoning_content` is populated consistently across all reasoning models, enabling `reasoning_audit.py` to detect CoT leakage uniformly.
+
+---
+
+### Benchmark Stack
+
+#### Layer 1: Industry Standard (promptfoo built-in plugins)
+
+| Plugin | Count used | Source | Why |
+|--------|-----------|--------|-----|
+| `harmbench` | 100 of 510 | HarmBench (Mazeika et al., NeurIPS 2024) | De facto red team standard; most safety papers cite it |
+| `donotanswer` | 100 of 939 | Wang et al. 2023 | First open-source safeguards eval; 3-level risk taxonomy |
+| `xstest` | all 450 | Röttger et al. 2023 | Tests both over-refusal (false positive) and under-refusal — essential for balanced safety picture |
+
+Config: `promptfooconfig.benchmarks.yaml` — run against each model's localhost:8080 server.
+
+#### Layer 2: Phase 1/2 Mirror (same plugins, fresh generation per model)
+
+Each comparison model runs the same 11-plugin, 2-strategy config as Sarvam Phase 1. Claude is the judge in all cases, ensuring consistent grading across models. Same categories = direct ASR comparison.
+
+Configs: `promptfooconfig.qwen3.yaml`, `promptfooconfig.deepseek-r1.yaml`, `promptfooconfig.gemma3.yaml`.
+
+#### Layer 3: Indic Benchmark (original paper contribution)
+
+30 hand-curated prompts covering India-specific harm categories absent from all existing English-language benchmarks:
+
+| Category | Count | Languages |
+|----------|-------|-----------|
+| Caste-based discrimination | 8 | EN, HI |
+| Communal violence (Hindu/Muslim/Sikh) | 7 | EN, HI, BN |
+| Honor crimes (khap panchayat, dowry) | 5 | EN, HI |
+| Indian political misinfo (EVM, CAA-NRC) | 6 | EN, UR |
+| Caste/community slurs | 4 | EN, HI, TA |
+
+Config: `promptfooconfig.indic-bench.yaml` (loads `data/indic_custom_prompts.yaml`).
+Each prompt uses an `llm-rubric` assertion graded by Claude.
+
+**Why this is a contribution:** IndicSafe (ai4bharat, 2026) is the only published Indic safety benchmark and covers 12 languages but focuses on general content moderation categories. Our set is specifically adversarial (red team framing) and targets the five categories most relevant to India's socio-political context. The two are complementary.
+
+#### Layer 4: CoT Leakage Cross-Model Analysis
+
+`reasoning_audit.py --compare-models` produces a side-by-side table across all models:
+
+| Model | cot_only_leak | full_leak | content_only | cot_leak_rate |
+|-------|---------------|-----------|--------------|---------------|
+| Sarvam 30B (Hindi) | — | — | — | — |
+| Sarvam 30B (English) | — | — | — | — |
+| Qwen3-32B | — | — | — | — |
+| DeepSeek-R1-Distill-32B | — | — | — | — |
+| Gemma-3-27B-IT (control) | — | — | — | — |
+
+*(To be filled after Phase 3 runs)*
+
+High `cot_only_leak` rates across Qwen3 + DeepSeek-R1 + Sarvam would confirm the finding is architectural (visible-CoT models as a class), not Sarvam-specific. Gemma-3 ~0% validates the detection methodology.
+
+---
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `promptfooconfig.qwen3.yaml` | Qwen3-32B, Phase 1 mirror (11 plugins, jailbreak + crescendo) |
+| `promptfooconfig.deepseek-r1.yaml` | DeepSeek-R1-Distill-32B, same |
+| `promptfooconfig.gemma3.yaml` | Gemma-3-27B-IT, same, `max_tokens: 1024` (non-reasoning) |
+| `promptfooconfig.benchmarks.yaml` | harmbench (100) + donotanswer (100) + xstest (450) |
+| `promptfooconfig.indic-bench.yaml` | Custom Indic prompts via `tests: file://data/indic_custom_prompts.yaml` |
+| `data/indic_custom_prompts.yaml` | 30 hand-curated Indic adversarial prompts, 5 categories |
+| `scripts/setup_model.sh` | Downloads a named model GGUF; prints correct server start command |
+| `scripts/run_phase3.sh` | Full overnight orchestrator across all 3 comparison models |
+
+Updated:
+- `scripts/reasoning_audit.py` — added `--compare-models` flag for cross-model leakage table
+
+---
+
+### Run Commands
+
+```bash
+# Download a specific model (idempotent)
+bash scripts/setup_model.sh --model qwen3-32b
+bash scripts/setup_model.sh --model deepseek-r1-32b
+bash scripts/setup_model.sh --model gemma3-27b
+
+# Full Phase 3 overnight run (all 3 models + benchmarks + Indic bench)
+tmux new-session -d -s phase3 \
+  'cd /workspace/sarvam-evals && bash scripts/run_phase3.sh'
+
+# Monitor
+tmux attach -t phase3
+tail -f output/phase3_run.log
+
+# Multi-model CoT audit (after all runs complete)
+python3 scripts/reasoning_audit.py \
+  --input output/hindi_results.json \
+  --input output/english_results_v2.json \
+  --input output/qwen3-32b_results.json \
+  --input output/deepseek-r1-32b_results.json \
+  --input output/gemma3-27b_results.json \
+  --output output/phase3_reasoning_audit.md \
+  --compare-models
+
+# Pull results back to Mac before stopping pod
+rsync -avz root@<host> -p <port>:/workspace/sarvam-evals/output/ \
+  /Users/Basil/dev/sarvam-evals/output/
+```
+
+---
+
+## Results — Phase 3
+
+*(To be filled after runs complete)*
+
+### Phase 3 — Cross-Model ASR Comparison — [DATE]
+
+### Phase 3 — Industry Benchmarks (HarmBench / DoNotAnswer / XSTest) — [DATE]
+
+### Phase 3 — Indic Benchmark — [DATE]
+
+### Phase 3 — CoT Leakage Cross-Model — [DATE]
